@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.log
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+
+# Generated weights: train locally; an optional release can distribute weights.
+checkpoints/*.pt
+checkpoints/*.pth
+
+# Source/redistribution permission has not been documented yet.
+data/SP500.csv
+
+# Unrelated China-index workbook.
+data/*.xlsx
