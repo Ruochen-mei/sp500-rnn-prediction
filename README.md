@@ -1,159 +1,732 @@
-# S&P 500 Return Prediction with a Manual Vanilla RNN
+# S&P 500 Prediction with Vanilla RNN
+# 基于 Vanilla RNN 的 S&P 500 指数预测
 
-使用历史 S&P 500 OHLCV 信息，学习预测下一交易日的 log return，并恢复为收盘价。这是一个 PyTorch 时间序列机器学习学习/实验项目，不是实际投资建议，也不代表可盈利的交易策略。
+## 中文
 
-## 当前版本：Relative Features → Next-day Log Return
+### 项目简介
 
-每个交易日构造五个相对特征（`epsilon = 1e-8`）：
+本项目使用 PyTorch 实现 Vanilla Recurrent Neural Network（Vanilla RNN），利用 S&P 500 的历史市场数据预测下一交易日的收益率，并进一步还原下一交易日的收盘指数。
 
-| 特征 | 计算公式 |
+项目主要用于复现和理解 RNN 在时间序列任务中的完整工作流程。为了更直观地理解循环神经网络内部的计算过程，模型没有直接调用 PyTorch 的 `nn.RNN`，而是手动实现隐藏状态在时间序列上的迭代更新。
+
+项目最初尝试直接使用历史 OHLCV 数据预测下一交易日的绝对收盘指数，但在跨时间段预测时出现了明显的泛化问题。因此，当前版本将任务调整为：
+
+```text
+历史 OHLCV
+    ↓
+构造相对变化特征
+    ↓
+过去 20 个交易日
+    ↓
+Manual Vanilla RNN
+    ↓
+预测下一交易日 Log Return
+    ↓
+还原下一交易日 Close
+```
+
+---
+
+## 1. 预测任务
+
+原始数据包含 S&P 500 每个交易日的：
+
+```text
+Open
+High
+Low
+Close
+Volume
+```
+
+为了降低长期价格水平变化对模型的影响，当前版本不直接使用绝对 OHLCV，而是构造 5 个相对特征：
+
+| 特征 | 计算方式 |
 |---|---|
-| close_return | `log(Close_t / Close_(t-1))` |
-| oc_return | `log(Close_t / Open_t)` |
-| range | `(High_t - Low_t) / Close_(t-1)` |
-| gap | `log(Open_t / Close_(t-1))` |
-| volume_change | `log((Volume_t + epsilon) / (Volume_(t-1) + epsilon))` |
+| Close Return | `log(Close_t / Close_(t-1))` |
+| Open-Close Return | `log(Close_t / Open_t)` |
+| Daily Range | `(High_t - Low_t) / Close_(t-1)` |
+| Opening Gap | `log(Open_t / Close_(t-1))` |
+| Volume Change | `log((Volume_t + ε) / (Volume_(t-1) + ε))` |
 
-输入是过去 20 个交易日的五维特征：`X.shape = [B, 20, 5]`。目标是紧接窗口之后一天的 `log(Close_(t+1) / Close_t)`，`y.shape = [B, 1]`。目标列存储当天 return，由滑动窗口取下一行作为标签，无需再向前 shift。
+其中：
 
-`ManualVanillaRNN` 手写时间步循环，不使用 `nn.RNN`：
+```text
+ε = 1e-8
+```
+
+每个样本使用过去 **20 个交易日**作为输入：
+
+```text
+X.shape = [batch_size, 20, 5]
+```
+
+预测目标为紧接着下一交易日的 log return：
+
+```text
+log(Close_(t+1) / Close_t)
+```
+
+因此：
+
+```text
+y.shape = [batch_size, 1]
+```
+
+预测得到 return 后，再还原为下一交易日的收盘指数：
+
+```text
+Predicted_Close_(t+1)
+    = Close_t × exp(Predicted_Return_(t+1))
+```
+
+---
+
+## 2. Manual Vanilla RNN
+
+模型位于：
+
+```text
+models/vanilla_rnn.py
+```
+
+为了理解 Vanilla RNN 的内部计算，本项目没有使用 `nn.RNN`，而是手动实现时间步循环。
+
+对于每一个时间步：
 
 ```text
 h_t = tanh(W_xh(x_t) + W_hh(h_(t-1)))
-prediction = output_layer(h_T)
-
-W_xh: Linear(5, 64)
-W_hh: Linear(64, 64, bias=False)
-output_layer: Linear(64, 1)
 ```
 
-训练使用 MSELoss、AdamW、学习率 1e-3、batch size 32、30 epochs、gradient clipping 1.0。支持 CUDA，不可用时使用 CPU。按最低 Validation Loss 保存最佳权重；当前 S&P 500 项目没有 early stopping。
+模型依次处理 20 个交易日的数据，并不断更新 hidden state。
 
-## 数据与时间切分
+处理完整个序列后：
 
-将 CSV 放在 `data/SP500.csv`（注意大小写）。必须包含 `Date, Open, High, Low, Close, Volume`；日期应可解析，OHLCV 为数值。当前本地数据共 24532 行，覆盖 1927-12-30～2025-08-29。训练使用 1990 年起的数据。
+```text
+prediction = output_layer(h_T)
+```
 
-原始数据的下载来源和再分发许可尚未在项目中记录，因此 `.gitignore` 默认排除该 CSV。公开发布前应补充实际来源、获取方式及再分发许可；项目不提供自动下载脚本，也不声称数据来自某一特定供应商。没有本地 CSV 时不能运行训练。
+模型结构为：
 
-| 集合 | 当前实际日期范围 | 数据行数 | 窗口数 |
-|---|---|---:|---:|
-| Train | 1990-01-02～2020-12-14 | 7800 | 7780 |
-| Validation | 2020-12-15～2023-04-21 | 591 | 591 |
-| Test | 2023-04-24～2025-08-29 | 591 | 591 |
+```text
+Input size:   5
+Hidden size:  64
+Output size:  1
 
-`config.py` 使用固定日期边界，运行时不按比例重切。`TRAIN_START` 为 1990-01-01；Test 从 2023-04-24 延续至 CSV 末尾，因此更换数据快照会改变测试集。
+W_xh:         Linear(5, 64)
+W_hh:         Linear(64, 64, bias=False)
+Output layer: Linear(64, 1)
+```
 
-先排序，再使用当天与前一天数据构造特征。Feature scaler 和 target scaler 分别仅 fit Train。Validation 使用 Train 最后 20 天作为初始 context，Test 使用 Validation 最后 20 天；所有 DataLoader 均 `shuffle=False`。评估是逐日一步预测，后续测试窗口可以使用已经发生的真实历史，不是多步递归预测。
+这一实现保留了 Vanilla RNN 最基本的循环结构，也便于后续与 LSTM、Transformer 等模型进行对比。
 
-## 项目结构
+---
+
+## 3. 数据与时间划分
+
+本项目使用 S&P 500 日频 OHLCV 数据。
+
+本地原始数据共有 24,532 条记录，时间范围为：
+
+```text
+1927-12-30 → 2025-08-29
+```
+
+当前实验使用 **1990 年以后**的数据，并严格按照时间顺序划分训练集、验证集和测试集：
+
+| 数据集 | 时间范围 | 数据量 |
+|---|---|---:|
+| Train | 1990-01-02 → 2020-12-14 | 7800 |
+| Validation | 2020-12-15 → 2023-04-21 | 591 |
+| Test | 2023-04-24 → 2025-08-29 | 591 |
+
+构造 20 日窗口后：
+
+```text
+Train:      (7780, 20, 5)
+Validation: (591, 20, 5)
+Test:       (591, 20, 5)
+```
+
+时间序列数据不进行随机切分。
+
+Feature scaler 和 target scaler 都只使用 Train 数据进行拟合。Validation 可以使用 Train 末尾已经发生的 20 个交易日作为历史 context，Test 同理可以使用 Validation 末尾的历史数据。
+
+整个过程中不会使用未来信息构造当前预测。
+
+原始 S&P 500 CSV 不包含在仓库中。如需运行项目，需要自行准备：
+
+```text
+data/SP500.csv
+```
+
+并包含：
+
+```text
+Date, Open, High, Low, Close, Volume
+```
+
+---
+
+## 4. 训练配置
+
+当前 Vanilla RNN 使用：
+
+| 参数 | 设置 |
+|---|---:|
+| Sequence Length | 20 |
+| Input Size | 5 |
+| Hidden Size | 64 |
+| Batch Size | 32 |
+| Epochs | 30 |
+| Learning Rate | 1e-3 |
+| Loss | MSELoss |
+| Optimizer | AdamW |
+| Gradient Clipping | 1.0 |
+
+程序会自动检测 CUDA，在 GPU 可用时使用 GPU 训练。
+
+训练过程中根据 Validation Loss 保存最佳模型：
+
+```text
+checkpoints/best_rnn.pt
+```
+
+模型权重由训练生成，不包含在当前 GitHub 仓库中。
+
+---
+
+## 5. 技术栈
+
+项目主要使用：
+
+- **Python**：项目主要开发语言
+- **PyTorch**：Vanilla RNN、训练和推理
+- **pandas**：时间序列数据读取与处理
+- **NumPy**：数值计算
+- **scikit-learn**：Feature / Target 标准化
+- **Matplotlib**：结果可视化
+- **Jupyter Notebook**：前期数据探索与实验
+
+---
+
+## 6. 项目结构
 
 ```text
 stock_rnn/
+│
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
+│
 ├── config.py
 ├── data.py
 ├── main.py
 ├── predict.py
 ├── utils.py
+│
 ├── models/
 │   ├── __init__.py
 │   └── vanilla_rnn.py
-├── data/SP500.csv                 # 自行准备，默认不提交
-├── checkpoints/best_rnn.pt        # 训练生成，默认不提交
-├── predictions.csv               # 当前 V2 实验结果
-├── prediction_plot.png
-├── explore.ipynb                  # 早期 V1 探索记录，不是当前训练入口
-├── analyze_data.py
-├── yearly_data_quality.csv
-└── data_quality_by_year.png
+│
+├── explore.ipynb
+└── analyze_data.py
 ```
 
-`explore.ipynb` 保留早期 2010 起点、absolute OHLCV/Close、比例切分的学习记录；当前 V2 的实现以 Python 脚本和 `config.py` 为准。中国指数 Excel 不属于本项目，已排除提交。
+主要文件：
 
-## 安装
+| 文件 | 作用 |
+|---|---|
+| `config.py` | 数据、模型及训练参数配置 |
+| `data.py` | 特征构造、时间切分、标准化和序列生成 |
+| `models/vanilla_rnn.py` | 手动实现 Vanilla RNN |
+| `main.py` | 模型训练、验证和测试 |
+| `predict.py` | 加载训练模型并进行完整预测评估 |
+| `utils.py` | 训练和评估的公共函数 |
+| `analyze_data.py` | 原始历史数据质量分析 |
+| `explore.ipynb` | 前期探索及早期实验记录 |
 
-建议使用 Python 3.11（本次验证环境）。进入包含 `main.py` 的项目根目录后执行：
+原始数据、模型 checkpoint、预测 CSV 和运行生成的图片等文件不包含在仓库中。
+
+---
+
+## 7. 安装与运行
+
+创建虚拟环境：
 
 ```bash
 python -m venv .venv
 ```
 
-Windows PowerShell 激活：
+Windows：
 
 ```powershell
 .venv\Scripts\Activate.ps1
 ```
 
-macOS/Linux 激活：
+Linux / macOS：
 
 ```bash
 source .venv/bin/activate
 ```
 
-然后安装：
+安装依赖：
 
 ```bash
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-运行依赖仅包含 PyTorch、NumPy、pandas、scikit-learn、Matplotlib。若要交互式打开历史 notebook，可额外安装 `jupyterlab`；它不是训练/预测依赖。CUDA 是否可用取决于本机驱动及 PyTorch 安装。
+准备数据：
 
-本次已有环境版本：PyTorch 2.8.0+cu128、NumPy 2.1.2、pandas 2.3.2、scikit-learn 1.7.1、Matplotlib 3.10.6。requirements 使用围绕这些已验证版本的小版本范围，不是精确环境锁文件。
+```text
+data/SP500.csv
+```
 
-## 运行
-
-所有命令必须在项目根目录执行，代码使用相对路径。
+训练模型：
 
 ```bash
-python -c "from data import load_data; load_data()"
 python main.py
+```
+
+训练完成后运行：
+
+```bash
 python predict.py
 ```
 
-`main.py` 训练并保存 `checkpoints/best_rnn.pt`，重新加载最佳权重后输出 Test Loss。`predict.py` 使用该权重评估 Test，保存 `predictions.csv` 和 `prediction_plot.png` 并显示图像。必须使用当前 V2 训练的权重，旧 V1 权重虽然形状相同但语义不兼容。
+`predict.py` 会在 Test Set 上进行逐日一步预测，并将模型结果与 Naive Baseline 进行比较。
 
-预测价格为 `Previous_Close * exp(Predicted_Return)`；Naive baseline 为前一交易日真实 Close，即预测 return 为 0。CSV 包含 Date、Previous_Close、Actual_Close、Predicted_Close、Naive_Close、Actual_Return、Predicted_Return。
+Naive Baseline 定义为：
 
-可选数据质量检查：
-
-```bash
-python analyze_data.py
+```text
+Predicted Close_(t+1) = Close_t
 ```
 
-运行训练/预测/分析会覆盖同名权重或结果文件；需要保留已有实验时先备份。无图形界面的环境可设置 `MPLBACKEND=Agg`。
+也就是假设下一交易日的 return 为 0。
 
-## 当前保存的实验结果
+---
 
-以下指标直接根据当前 `predictions.csv` 的 591 个 Test 样本重新计算，保留现有实验结果，未用重新训练结果替换：
+## 8. 实验结果
 
-| 指标 | Vanilla RNN | Naive |
+最终模型在 **2023 年 4 月至 2025 年 8 月的 591 个测试样本**上进行评估。
+
+| Metric | Vanilla RNN | Naive Baseline |
 |---|---:|---:|
-| Price MAE（指数点） | 34.8929 | 34.6483 |
-| Price RMSE（指数点） | 51.9982 | 51.6628 |
-| MAE improvement over Naive | -0.7059% | — |
-| RMSE improvement over Naive | -0.6493% | — |
+| Price MAE | 34.89 | 34.65 |
+| Price RMSE | 52.00 | 51.66 |
 | Return MAE | 0.006645 | — |
 | Return RMSE | 0.009817 | — |
 | Directional Accuracy | 52.62% | — |
 
-Improvement = `(Naive error - RNN error) / Naive error * 100%`；负值表示劣于 Naive。方向准确率按 `sign(predicted_return) == sign(actual_return)` 计算，包含零收益情况。当前模型的价格误差略高于 Naive，没有显示超越该基线的效果。
+### 从 Absolute Price 到 Return Prediction
 
-![Current V2 price prediction](prediction_plot.png)
+项目的早期版本直接使用 absolute OHLCV 预测下一交易日的绝对 Close。
 
-当前目录没有保存完整训练日志，因此不把历史 V1 的 validation/test loss 当作 V2 训练结果。训练输出的 loss 是标准化 target 上的 MSE，与真实价格 RMSE 不同。
+该版本在测试集上的结果约为：
 
-历史 V1（用户记录，1990 起点）直接用 absolute OHLCV 预测 Close：Validation Loss 0.068123、Test Loss 1.996452、Price MAE 901.31、Price RMSE 1049.87。V2 改为相对特征与 return target 后价格误差明显降低，但仍需与 Naive 比较；两个版本的 scaled loss 因目标含义不同不能直接比较。
+```text
+Price MAE:  901.31
+Price RMSE: 1049.87
+```
 
-当前实现未固定随机种子，也没有持久化 scaler（预测时根据相同 CSV 和配置重建）。重训数值可能不同；复现已有权重需要相同数据快照、配置和相容环境。这些实验未纳入交易成本或构建交易策略。
+一个明显的问题是：随着 S&P 500 长期价格水平变化，后期测试数据的绝对数值范围与训练阶段存在较大差异，模型的泛化效果很差。
 
-## 发布说明
+因此当前版本将输入改为相对变化特征，并将预测目标改成 next-day log return。
 
-建议提交源码、README、requirements、.gitignore、历史 notebook，以及用于展示的预测和数据质量结果。权重默认不提交；如需分享，可作为可选 Release 附件，并注明对应配置和数据快照。CSV 在确认来源和再分发许可前保持本地。项目暂未指定开源许可证，发布者应自行选择合适许可证。
+修改后：
 
-本项目仅用于机器学习学习与实验，不构成投资建议。
+```text
+Price MAE:  34.89
+Price RMSE: 52.00
+```
 
-## 运行验证记录
+相比直接预测绝对价格，模型在不同市场价格水平之间的泛化能力有了明显改善。
 
-2026-10-07：在已有 Python 3.11 环境的隔离副本中，现有 checkpoint 预测、完整 30 轮训练、训练后的预测及数据质量分析均正常退出；历史 notebook 全部代码单元执行通过。验证结果没有覆盖项目原有实验文件。依赖安装仅完成已有环境的离线 dry-run 检查，未在全新虚拟环境中重新下载安装。
+但与简单的 Naive Baseline 比较：
+
+```text
+Vanilla RNN MAE: 34.89
+Naive MAE:       34.65
+
+Vanilla RNN RMSE: 52.00
+Naive RMSE:       51.66
+```
+
+当前 Vanilla RNN 仍然略差于 Naive Baseline。
+
+模型的 Directional Accuracy 为：
+
+```text
+52.62%
+```
+
+虽然略高于 50%，但差距较小，仅凭当前测试结果还不足以说明模型具有稳定的方向预测能力。
+
+因此，本次实验比较清楚地体现了两个问题：
+
+1. **预测目标和数据表示方式很重要。**  
+   使用 return 代替 absolute price，可以明显缓解长期价格尺度变化带来的泛化问题。
+
+2. **解决价格尺度问题并不意味着解决了预测问题。**  
+   下一交易日 return 本身具有较强噪声，仅依赖历史 OHLCV 的简单 Vanilla RNN 并没有明显超过 persistence baseline。
+
+后续可以在保持数据、时间切分、预测目标和评估方式一致的情况下，继续比较：
+
+```text
+Vanilla RNN
+     ↓
+LSTM
+     ↓
+Transformer
+```
+
+从而进一步观察不同序列模型在同一预测任务上的表现。
+
+---
+
+# English
+
+## Overview
+
+This project implements a Vanilla Recurrent Neural Network (RNN) in PyTorch to predict the next-day return of the S&P 500 index using historical market data.
+
+The project was developed as a reproduction and learning exercise for recurrent neural networks and financial time-series prediction. Instead of using PyTorch's built-in `nn.RNN`, the recurrent computation is implemented manually so that the hidden-state update and sequential computation remain explicit.
+
+The first version directly predicted the next closing price from historical OHLCV values. After observing poor generalization across different market periods, the task was reformulated as:
+
+```text
+Historical OHLCV
+       ↓
+Relative Features
+       ↓
+Previous 20 Trading Days
+       ↓
+Manual Vanilla RNN
+       ↓
+Next-Day Log Return
+       ↓
+Next-Day Closing Price
+```
+
+---
+
+## 1. Prediction Task
+
+The original dataset contains daily:
+
+```text
+Open
+High
+Low
+Close
+Volume
+```
+
+Instead of directly using absolute OHLCV values, five relative features are constructed:
+
+| Feature | Definition |
+|---|---|
+| Close Return | `log(Close_t / Close_(t-1))` |
+| Open-Close Return | `log(Close_t / Open_t)` |
+| Daily Range | `(High_t - Low_t) / Close_(t-1)` |
+| Opening Gap | `log(Open_t / Close_(t-1))` |
+| Volume Change | `log((Volume_t + ε) / (Volume_(t-1) + ε))` |
+
+where:
+
+```text
+ε = 1e-8
+```
+
+Each sample contains the previous 20 trading days:
+
+```text
+X.shape = [batch_size, 20, 5]
+```
+
+The target is the next-day log return:
+
+```text
+log(Close_(t+1) / Close_t)
+```
+
+with:
+
+```text
+y.shape = [batch_size, 1]
+```
+
+The predicted return is converted back to the next closing price using:
+
+```text
+Predicted_Close_(t+1)
+    = Close_t × exp(Predicted_Return_(t+1))
+```
+
+---
+
+## 2. Manual Vanilla RNN
+
+The model is implemented in:
+
+```text
+models/vanilla_rnn.py
+```
+
+The project does not use `nn.RNN`.
+
+At each time step:
+
+```text
+h_t = tanh(W_xh(x_t) + W_hh(h_(t-1)))
+```
+
+After processing the complete 20-day sequence:
+
+```text
+prediction = output_layer(h_T)
+```
+
+Model dimensions:
+
+```text
+Input size:   5
+Hidden size:  64
+Output size:  1
+
+W_xh:         Linear(5, 64)
+W_hh:         Linear(64, 64, bias=False)
+Output layer: Linear(64, 1)
+```
+
+The implementation keeps the recurrent computation transparent and also provides a simple baseline for later comparison with LSTM and Transformer architectures.
+
+---
+
+## 3. Dataset and Split
+
+The local dataset contains 24,532 daily S&P 500 observations covering:
+
+```text
+1927-12-30 → 2025-08-29
+```
+
+The current experiment uses observations starting from 1990.
+
+The data is split chronologically:
+
+| Dataset | Period | Samples |
+|---|---|---:|
+| Train | 1990-01-02 → 2020-12-14 | 7800 |
+| Validation | 2020-12-15 → 2023-04-21 | 591 |
+| Test | 2023-04-24 → 2025-08-29 | 591 |
+
+After constructing 20-day sequences:
+
+```text
+Train:      (7780, 20, 5)
+Validation: (591, 20, 5)
+Test:       (591, 20, 5)
+```
+
+The feature scaler and target scaler are fitted on the training set only.
+
+The original dataset is not included in this repository. To reproduce the experiment, place a compatible dataset at:
+
+```text
+data/SP500.csv
+```
+
+with:
+
+```text
+Date, Open, High, Low, Close, Volume
+```
+
+---
+
+## 4. Training Configuration
+
+| Parameter | Value |
+|---|---:|
+| Sequence Length | 20 |
+| Input Size | 5 |
+| Hidden Size | 64 |
+| Batch Size | 32 |
+| Epochs | 30 |
+| Learning Rate | 1e-3 |
+| Loss | MSELoss |
+| Optimizer | AdamW |
+| Gradient Clipping | 1.0 |
+
+CUDA is used automatically when available.
+
+The checkpoint with the lowest validation loss is saved locally as:
+
+```text
+checkpoints/best_rnn.pt
+```
+
+Model checkpoints are not included in the repository.
+
+---
+
+## 5. Tech Stack
+
+- **Python**
+- **PyTorch**
+- **pandas**
+- **NumPy**
+- **scikit-learn**
+- **Matplotlib**
+- **Jupyter Notebook**
+
+---
+
+## 6. Project Structure
+
+```text
+stock_rnn/
+│
+├── README.md
+├── requirements.txt
+├── .gitignore
+│
+├── config.py
+├── data.py
+├── main.py
+├── predict.py
+├── utils.py
+│
+├── models/
+│   ├── __init__.py
+│   └── vanilla_rnn.py
+│
+├── explore.ipynb
+└── analyze_data.py
+```
+
+| File | Description |
+|---|---|
+| `config.py` | Dataset, model, and training configuration |
+| `data.py` | Feature construction, chronological splitting, scaling, and sequence generation |
+| `models/vanilla_rnn.py` | Manual Vanilla RNN implementation |
+| `main.py` | Training, validation, checkpoint selection, and testing |
+| `predict.py` | Prediction and evaluation on the test set |
+| `utils.py` | Shared training and evaluation utilities |
+| `analyze_data.py` | Historical dataset quality analysis |
+| `explore.ipynb` | Early exploration and experiments |
+
+Generated prediction files, figures, checkpoints, and the original dataset are not included in the repository.
+
+---
+
+## 7. Installation and Usage
+
+Create a virtual environment:
+
+```bash
+python -m venv .venv
+```
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Place the dataset at:
+
+```text
+data/SP500.csv
+```
+
+Train the model:
+
+```bash
+python main.py
+```
+
+Evaluate the trained model:
+
+```bash
+python predict.py
+```
+
+The prediction script compares the RNN with a naive persistence baseline:
+
+```text
+Predicted Close_(t+1) = Close_t
+```
+
+---
+
+## 8. Results
+
+The final model is evaluated on **591 test observations from April 2023 to August 2025**.
+
+| Metric | Vanilla RNN | Naive Baseline |
+|---|---:|---:|
+| Price MAE | 34.89 | 34.65 |
+| Price RMSE | 52.00 | 51.66 |
+| Return MAE | 0.006645 | — |
+| Return RMSE | 0.009817 | — |
+| Directional Accuracy | 52.62% | — |
+
+### From Absolute Price to Return Prediction
+
+An earlier version directly predicted the absolute closing price from historical OHLCV values and obtained approximately:
+
+```text
+Price MAE:  901.31
+Price RMSE: 1049.87
+```
+
+The model generalized poorly when the absolute level of the S&P 500 in the test period differed substantially from the training period.
+
+After switching to relative features and next-day log-return prediction:
+
+```text
+Price MAE:  34.89
+Price RMSE: 52.00
+```
+
+This substantially reduced the error associated with changes in the long-term price level.
+
+However, the persistence baseline still performs slightly better:
+
+```text
+Vanilla RNN MAE: 34.89
+Naive MAE:       34.65
+
+Vanilla RNN RMSE: 52.00
+Naive RMSE:       51.66
+```
+
+The model achieves a directional accuracy of:
+
+```text
+52.62%
+```
+
+which is slightly above 50%, but the difference is too small to establish a reliable predictive advantage from this experiment alone.
+
+The experiment therefore highlights two observations:
+
+1. **Target representation matters.**  
+   Predicting returns instead of absolute prices substantially improves generalization across different market price levels.
+
+2. **Better representation does not make next-day returns easy to predict.**  
+   With historical OHLCV information alone, the Vanilla RNN does not outperform a simple persistence baseline.
+
+A natural continuation is to keep the dataset, target, split, and evaluation procedure fixed while comparing:
+
+```text
+Vanilla RNN
+     ↓
+LSTM
+     ↓
+Transformer
+```
+
+This project is intended as an experiment in recurrent neural networks and financial time-series modeling rather than as a trading system.
